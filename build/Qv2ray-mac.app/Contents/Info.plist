@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>              <string>Qv2ray-mac</string>
+    <key>CFBundleDisplayName</key>       <string>Qv2ray for Mac</string>
+    <key>CFBundleIdentifier</key>        <string>com.qv2ray.mac</string>
+    <key>CFBundleVersion</key>           <string>3.0.0</string>
+    <key>CFBundleShortVersionString</key><string>3.0.0</string>
+    <key>CFBundleExecutable</key>        <string>Qv2ray-mac</string>
+    <key>CFBundlePackageType</key>       <string>APPL</string>
+    <key>CFBundleIconFile</key>          <string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key>    <string>14.0</string>
+    <key>LSUIElement</key>               <true/>
+    <key>NSHighResolutionCapable</key>   <true/>
+    <key>LSApplicationCategoryType</key> <string>public.app-category.utilities</string>
+    <key>NSUserNotificationAlertStyle</key> <string>alert</string>
+</dict>
+</plist>
