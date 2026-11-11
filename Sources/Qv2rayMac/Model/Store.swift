@@ -15,7 +15,11 @@ final class ProfileStore: ObservableObject {
 
     @Published var data = ConnectionsFile()
     @Published var routingSchemes: [RoutingScheme] = RoutingScheme.builtIns()
-    @Published var preferences = Preferences()
+    /// The UI language is pushed into `L10n` here (didSet runs before SwiftUI re-renders), not in a
+    /// view's `.onChange` — that fires *after* the re-render, leaving every view in the old language.
+    @Published var preferences = Preferences() {
+        didSet { if preferences.language != oldValue.language { L10n.languageOverride = preferences.language } }
+    }
     @Published var lastConnected: UUID? = nil { didSet { saveLastState() } }
     /// nil value = test ran and timed out; missing key = never tested.
     @Published var latencies: [UUID: Int?] = [:]

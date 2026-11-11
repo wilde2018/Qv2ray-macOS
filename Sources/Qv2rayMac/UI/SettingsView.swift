@@ -27,7 +27,6 @@ struct SettingsView: View {
 
     private func apply(old: Preferences, new: Preferences) {
         store.savePrefs()
-        if old.language != new.language { L10n.languageOverride = new.language }
         if old.theme != new.theme { model.applyAppearance() }
         if old.startAtLogin != new.startAtLogin { model.applyLoginItem() }
         if old.assetsPath != new.assetsPath { runner.refreshCoreInfo() }
