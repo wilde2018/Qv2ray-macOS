@@ -139,6 +139,46 @@ enum SelfTest {
         let own = ConfigGenerator.prepareCustom(["inbounds": [["protocol": "socks", "port": 7890, "listen": "127.0.0.1"]]], prefs: prefs)
         check(ConfigGenerator.proxyPorts(in: own).socks == 7890 && ConfigGenerator.proxyPorts(in: own).http == nil, "custom inbounds kept")
 
+        print("[4b] TUN mode")
+        let full = ConfigGenerator.fullConfig(profile: profile, prefs: prefs, scheme: global)
+        let tunned = ConfigGenerator.applyTun(full, interface: "en0")
+        let tOut = tunned["outbounds"] as? [[String: Any]] ?? []
+        func iface(_ o: [String: Any]) -> String? {
+            ((o["streamSettings"] as? [String: Any])?["sockopt"] as? [String: Any])?["interface"] as? String
+        }
+        check(tOut.count == 3 && iface(tOut[0]) == "en0" && iface(tOut[1]) == "en0" && iface(tOut[2]) == nil,
+              "TUN binds proxy + direct outbounds to the physical interface, not blackhole")
+        check((tOut[0]["streamSettings"] as? [String: Any])?["network"] as? String == "ws", "TUN keeps existing streamSettings")
+        let tRules = ((tunned["routing"] as? [String: Any])?["rules"] as? [[String: Any]]) ?? []
+        check(tRules.first?["outboundTag"] as? String == "api"
+              && tRules.contains { $0["port"] as? String == "53" && $0["outboundTag"] as? String == "direct" }
+              && tRules.firstIndex { $0["port"] as? String == "53" }! < tRules.count - 1,
+              "TUN sends DNS direct, before the catch-all")
+        let pinned = ConfigGenerator.applyTun(["outbounds": [["protocol": "freedom", "tag": "d",
+                                                                "streamSettings": ["sockopt": ["interface": "en7"]]]]], interface: "en0")
+        check(iface((pinned["outbounds"] as? [[String: Any]])?.first ?? [:]) == "en7", "TUN keeps an explicitly pinned interface")
+        let cmd = TunManager.privilegedCommand(args: ["/opt/x y/tun2socks", "utun123", "198.18.0.1",
+                                                      "socks5://127.0.0.1:1089", "1", "/tmp/it's dir", "/tmp/l.log"])
+        func shParses(_ script: String) -> Bool {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = ["-n", "-c", script]
+            guard (try? p.run()) != nil else { return false }
+            p.waitUntilExit()
+            return p.terminationStatus == 0
+        }
+        check(shParses(TunManager.supervisorScript) && shParses(cmd) && cmd.hasSuffix(" &"),
+              "TUN supervisor script + quoted privileged command parse")
+        check(TunManager.appleScriptQuote(#"a "b" \c"#) == #""a \"b\" \\c""#, "AppleScript string quoting")
+
+        if Bundle.main.bundleIdentifier != nil, let xray = BundledTools.xray {
+            // Only meaningful when run from inside a packaged app (make-app.sh).
+            check(CoreRunner.autoDetectCore() == xray && BundledTools.isBundled(xray)
+                  && CoreRunner.resolveAssetsDir(corePath: xray, override: "") == BundledTools.assetsDir?.path
+                  && TunManager.autoDetectBinary() == BundledTools.tun2socks,
+                  "bundled Xray, geodata and tun2socks are preferred")
+        }
+
         print("[5] Persistence robustness")
         let dec = JSONDecoder()
         let p1 = try? dec.decode(Preferences.self, from: Data(#"{"socksPort": 7890, "updateRepo": "Qv2ray/Qv2ray"}"#.utf8))

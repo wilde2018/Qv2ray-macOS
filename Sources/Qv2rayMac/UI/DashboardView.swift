@@ -7,6 +7,8 @@ struct DashboardView: View {
     @EnvironmentObject private var runner: CoreRunner
     @EnvironmentObject private var stats: SpeedSampler
     @EnvironmentObject private var proxy: SystemProxyManager
+    @EnvironmentObject private var tun: TunManager
+    @State private var copiedItem: String?
 
     private var coreMissing: Bool {
         runner.resolvedCorePath().map { !FileManager.default.isExecutableFile(atPath: $0) } ?? true
@@ -228,37 +230,74 @@ struct DashboardView: View {
     private var proxyCard: some View {
         let prefs = store.preferences
         let host = prefs.systemProxyHost
+        var endpoints: [(id: String, symbol: String, title: String, value: String)] = []
+        if prefs.useSocks { endpoints.append(("socks", "arrow.left.arrow.right", "SOCKS5", "\(host):\(prefs.socksPort)")) }
+        if prefs.useHTTP { endpoints.append(("http", "globe", "HTTP", "\(host):\(prefs.httpPort)")) }
+
         return Card(fillHeight: true) {
-            VStack(alignment: .leading, spacing: 10) {
-                CardHeader(title: L10n.tr("dash.localProxy"), symbol: "network")
-                Toggle(L10n.tr("tray.systemProxy"), isOn: Binding(
-                    get: { model.systemProxyEnabled },
-                    set: { on in Task { await model.setSystemProxy(on) } }))
-                    .toggleStyle(.switch)
-                    .disabled(proxy.isBusy)
-                if prefs.useSocks { endpointRow("SOCKS5", "\(host):\(prefs.socksPort)") }
-                if prefs.useHTTP { endpointRow("HTTP", "\(host):\(prefs.httpPort)") }
-                Spacer(minLength: 0)
-                Button {
-                    copy(terminalCommand(prefs: prefs))
-                    model.showBanner(L10n.tr("dash.copiedShell"), error: false)
-                } label: {
-                    Label(L10n.tr("dash.copyShell"), systemImage: "terminal")
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    CardHeader(title: L10n.tr("dash.localProxy"), symbol: "network")
+                    Spacer()
+                    if !endpoints.isEmpty {
+                        copyButton("shell", terminalCommand(prefs: prefs), symbol: "terminal",
+                                   help: L10n.tr("dash.copyShell"))
+                    }
                 }
+
+                ProxyGroup {
+                    ProxyRow(symbol: "desktopcomputer", title: L10n.tr("tray.systemProxy"),
+                             active: model.systemProxyEnabled) {
+                        Toggle(L10n.tr("tray.systemProxy"), isOn: Binding(
+                            get: { model.systemProxyEnabled },
+                            set: { on in Task { await model.setSystemProxy(on) } }))
+                            .disabled(proxy.isBusy)
+                    }
+                    ProxySeparator()
+                    ProxyRow(symbol: "point.3.filled.connected.trianglepath.dotted", title: L10n.tr("tun.title"),
+                             value: tun.deviceName, active: model.tunModeEnabled) {
+                        Toggle(L10n.tr("tun.title"), isOn: Binding(
+                            get: { model.tunModeEnabled },
+                            set: { on in Task { await model.setTunMode(on) } }))
+                            .disabled(model.isBusy)
+                    }
+                    ForEach(endpoints, id: \.id) { e in
+                        ProxySeparator()
+                        ProxyRow(symbol: e.symbol, title: e.title, value: e.value) {
+                            copyButton(e.id, e.value, help: L10n.tr("common.copy"))
+                        }
+                    }
+                }
+                .toggleStyle(.switch)
                 .controlSize(.small)
+                .labelsHidden()
+                Spacer(minLength: 0)
             }
         }
     }
 
-    private func endpointRow(_ kind: String, _ value: String) -> some View {
-        HStack {
-            Text(kind).font(.caption.weight(.semibold)).foregroundStyle(.secondary).frame(width: 56, alignment: .leading)
-            Text(value).font(.callout.monospaced()).textSelection(.enabled)
-            Spacer()
-            Button { copy(value) } label: { Image(systemName: "doc.on.doc") }
-                .buttonStyle(.borderless)
-                .help(L10n.tr("common.copy"))
+    /// Capsule button the same footprint as a small switch, so the trailing column lines up.
+    /// Briefly flips to a green checkmark after copying.
+    private func copyButton(_ id: String, _ text: String, symbol: String = "doc.on.doc", help: String) -> some View {
+        let done = copiedItem == id
+        return Button {
+            copy(text)
+            withAnimation(.snappy) { copiedItem = id }
+            Task {
+                try? await Task.sleep(for: .seconds(1.4))
+                if copiedItem == id { withAnimation(.snappy) { copiedItem = nil } }
+            }
+        } label: {
+            Image(systemName: done ? "checkmark" : symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(done ? Color.green : Color.secondary)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 32, height: 19)
+                .background(Capsule().fill(done ? Color.green.opacity(0.16) : Color.primary.opacity(0.07)))
+                .contentShape(Capsule())
         }
+        .buttonStyle(.plain)
+        .help(help)
     }
 
     private func terminalCommand(prefs: Preferences) -> String {
@@ -275,6 +314,63 @@ struct DashboardView: View {
     private func copy(_ s: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(s, forType: .string)
+    }
+}
+
+// MARK: - Local proxy rows
+
+/// Inset, softly filled group of rows (System Settings style).
+private struct ProxyGroup<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(spacing: 0) { content }
+            .background {
+                let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+                shape.fill(Color.primary.opacity(0.035))
+                    .overlay(shape.strokeBorder(Color.primary.opacity(0.06)))
+            }
+    }
+}
+
+/// Hairline between rows, inset to start under the titles (past the icon tile).
+private struct ProxySeparator: View {
+    var body: some View { Divider().padding(.leading, 40) }
+}
+
+/// One compact line: icon tile · title ··· secondary value · trailing control in a fixed-width column.
+/// Only two text styles (callout medium / caption secondary), so every row reads the same.
+private struct ProxyRow<Trailing: View>: View {
+    var symbol: String
+    var title: String
+    var value: String? = nil
+    var active = false
+    @ViewBuilder var trailing: Trailing
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(active ? Color.white : Color.secondary)
+                .frame(width: 22, height: 22)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(active ? AnyShapeStyle(Color.accentColor.gradient) : AnyShapeStyle(Color.primary.opacity(0.07))))
+                .shadow(color: active ? Color.accentColor.opacity(0.35) : .clear, radius: 3, y: 1)
+            Text(title).font(.callout.weight(.medium)).lineLimit(1)
+            Spacer(minLength: 8)
+            if let value {
+                Text(value)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            trailing.frame(width: 40, alignment: .trailing)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .animation(.snappy, value: active)
     }
 }
 

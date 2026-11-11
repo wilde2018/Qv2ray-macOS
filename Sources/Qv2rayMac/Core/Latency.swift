@@ -53,6 +53,8 @@ enum LatencyTester {
         var assetsPath: String?
         var testURL: String
         var timeout: Int
+        /// Set while TUN is up: test outbounds must bypass the tunnel too.
+        var bindInterface: String?
     }
 
     @MainActor
@@ -66,7 +68,8 @@ enum LatencyTester {
                            arguments: runner.legacyCLI ? ["-config", configURL.path] : ["run", "-c", configURL.path],
                            configURL: configURL, runtimeDir: store.runtimeDir,
                            assetsPath: CoreRunner.resolveAssetsDir(corePath: corePath, override: prefs.assetsPath),
-                           testURL: prefs.latencyTestURL, timeout: prefs.latencyTimeoutSec)
+                           testURL: prefs.latencyTestURL, timeout: prefs.latencyTimeoutSec,
+                           bindInterface: TunManager.shared.isActive ? runner.boundInterface : nil)
     }
 
     /// Runs a temporary core instance with one inbound per profile and measures the
@@ -77,7 +80,8 @@ enum LatencyTester {
         let basePort = findFreePortBlock(count: profiles.count)
         guard basePort > 0, let ctx = await prepareContext() else { return [:] }
 
-        let (config, ports) = ConfigGenerator.latencyTestConfig(profiles: profiles, basePort: basePort)
+        var (config, ports) = ConfigGenerator.latencyTestConfig(profiles: profiles, basePort: basePort)
+        if let iface = ctx.bindInterface { config = ConfigGenerator.applyTun(config, interface: iface) }
         guard let data = try? jsonData(from: config), (try? data.write(to: ctx.configURL, options: .atomic)) != nil else { return [:] }
 
         let proc = Process()

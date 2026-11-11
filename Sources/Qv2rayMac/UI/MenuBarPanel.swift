@@ -8,6 +8,7 @@ struct MenuBarPanel: View {
     @EnvironmentObject private var runner: CoreRunner
     @EnvironmentObject private var stats: SpeedSampler
     @EnvironmentObject private var proxy: SystemProxyManager
+    @EnvironmentObject private var tun: TunManager
 
     @State private var groupID: UUID?
     @State private var hovered: UUID?
@@ -145,8 +146,24 @@ struct MenuBarPanel: View {
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .disabled(proxy.isBusy)
+
+                Toggle(isOn: Binding(get: { model.tunModeEnabled },
+                                     set: { on in Task { await model.setTunMode(on) } })) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(L10n.tr("tun.title")).font(.callout)
+                        Text(tunSubtitle).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .disabled(model.isBusy)
             }
         }
+    }
+
+    private var tunSubtitle: String {
+        if let dev = tun.deviceName { return String(format: L10n.tr("tun.subtitle.on"), dev) }
+        return L10n.tr("tun.subtitle.off")
     }
 
     private var proxySubtitle: String {

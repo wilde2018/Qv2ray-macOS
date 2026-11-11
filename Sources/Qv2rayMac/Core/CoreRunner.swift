@@ -62,6 +62,8 @@ final class CoreRunner: ObservableObject {
     @Published private(set) var startedAt: Date? = nil
     /// Where the running config's local SOCKS / HTTP inbounds listen.
     @Published private(set) var proxyPorts = ConfigGenerator.ProxyPorts()
+    /// The physical interface the running core's outbounds are bound to (TUN mode), if any.
+    @Published private(set) var boundInterface: String? = nil
     /// Fingerprint of the inputs the running core was launched with.
     private(set) var launchSignature = ""
 
@@ -91,7 +93,10 @@ final class CoreRunner: ObservableObject {
         "/usr/bin/v2ray",
     ]
 
+    /// Explicit setting (handled by the caller) → the Xray embedded in the app bundle →
+    /// a system install (Homebrew / PATH).
     nonisolated static func autoDetectCore() -> String? {
+        if let bundled = BundledTools.xray { return bundled }
         for p in candidatePaths where FileManager.default.isExecutableFile(atPath: p) { return p }
         for dir in (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":") {
             for name in ["xray", "v2ray"] {
@@ -108,6 +113,8 @@ final class CoreRunner: ObservableObject {
     nonisolated static func resolveAssetsDir(corePath: String, override: String) -> String? {
         if !override.isEmpty { return override }
         let fm = FileManager.default
+        let bundledAssets = BundledTools.assetsDir
+        if BundledTools.isBundled(corePath), let dir = bundledAssets { return dir.path }
         let binDir = URL(fileURLWithPath: corePath).resolvingSymlinksInPath().deletingLastPathComponent()
         var candidates = [binDir, binDir.appendingPathComponent("dat")]
         for name in ["xray", "v2ray"] {
@@ -115,6 +122,8 @@ final class CoreRunner: ObservableObject {
             candidates.append(URL(fileURLWithPath: "/opt/homebrew/share/\(name)"))
             candidates.append(URL(fileURLWithPath: "/usr/local/share/\(name)"))
         }
+        // Last resort: the geodata shipped with the app also works for a system core.
+        if let dir = bundledAssets { candidates.append(dir) }
         for dir in candidates {
             if fm.fileExists(atPath: dir.appendingPathComponent("geoip.dat").path)
                 || fm.fileExists(atPath: dir.appendingPathComponent("geosite.dat").path) {
@@ -181,7 +190,7 @@ final class CoreRunner: ObservableObject {
         }
 
         // Generate config
-        let config: [String: Any]
+        var config: [String: Any]
         if profile.proto == .custom {
             guard let d = profile.customConfigJSON.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
@@ -191,6 +200,20 @@ final class CoreRunner: ObservableObject {
             config = ConfigGenerator.prepareCustom(obj, prefs: prefs)
         } else {
             config = ConfigGenerator.fullConfig(profile: profile, prefs: prefs, scheme: store.currentRoutingScheme)
+        }
+
+        // TUN mode: pin outbounds to the physical interface so they bypass the tunnel.
+        var bound: String? = nil
+        if prefs.tunEnabled && coreVersion == nil, let (v, t) = await Self.queryVersion(path: corePath) {
+            // Auto-connect at launch can race refreshCoreInfo(); TUN needs to know the core type.
+            coreVersion = v
+            coreType = t
+            legacyCLI = v.hasPrefix("V2Ray 4.")
+        }
+        if prefs.tunEnabled && coreType == .xray {
+            bound = await Task.detached { TunManager.defaultInterface() }.value
+            guard gen == generation else { throw RunnerError.cancelled }
+            if let iface = bound { config = ConfigGenerator.applyTun(config, interface: iface) }
         }
 
         // Pre-flight: every inbound port must be free
@@ -263,6 +286,7 @@ final class CoreRunner: ObservableObject {
         state = .running(pid: p.processIdentifier, name: profile.displayName)
         startedAt = Date()
         proxyPorts = ConfigGenerator.proxyPorts(in: config)
+        boundInterface = bound
         launchSignature = Self.signature(profile: profile, prefs: prefs, scheme: store.currentRoutingScheme)
         appendLog("✓ Core started (pid \(p.processIdentifier))")
 
@@ -314,6 +338,7 @@ final class CoreRunner: ObservableObject {
         currentProfile = nil
         startedAt = nil
         proxyPorts = ConfigGenerator.ProxyPorts()
+        boundInterface = nil
         launchSignature = ""
         closeLogFile()
     }
@@ -361,6 +386,8 @@ final class CoreRunner: ObservableObject {
         p.subUpdateIntervalHours = 0; p.subUserAgent = ""; p.setSystemProxyOnConnect = false
         p.proxyBypassDomains = []; p.statsIntervalMS = 0; p.autoRestartCore = false
         p.maxRestartAttempts = 0; p.updateRepo = ""; p.lastRuleSchemeID = nil
+        // TUN on/off is applied by AppModel itself (it restarts the core when toggled).
+        p.tunEnabled = false; p.tunBinaryPath = ""
         let enc = JSONEncoder()
         enc.outputFormatting = .sortedKeys
         let parts = [try? enc.encode(profile), try? enc.encode(p), try? enc.encode(scheme)]

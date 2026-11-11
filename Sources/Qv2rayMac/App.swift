@@ -28,6 +28,7 @@ final class AppModel: ObservableObject {
     let runner = CoreRunner.shared
     let stats = SpeedSampler.shared
     let proxy = SystemProxyManager.shared
+    let tun = TunManager.shared
     let subs = SubscriptionService.shared
 
     struct Banner: Identifiable, Equatable {
@@ -78,6 +79,7 @@ final class AppModel: ObservableObject {
         }.store(in: &cancellables)
         // Re-publish nested changes so views that only observe AppModel stay fresh.
         runner.objectWillChange.merge(with: store.objectWillChange).merge(with: proxy.objectWillChange)
+            .merge(with: tun.objectWillChange)
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
     }
@@ -86,6 +88,10 @@ final class AppModel: ObservableObject {
         guard !launched else { return }
         launched = true
         runner.onCrash = { [weak self] code, willRestart in self?.handleCrash(code: code, willRestart: willRestart) }
+        tun.onUnexpectedStop = { [weak self] in
+            self?.showBanner(L10n.tr("tun.stoppedUnexpectedly"), error: true)
+            Notifier.notify(title: L10n.tr("tun.stoppedUnexpectedly"), body: "")
+        }
         L10n.languageOverride = store.preferences.language
         applyAppearance()
         // Demo/snapshot mode never probes the core, fetches subscriptions or touches the system proxy.
@@ -107,6 +113,7 @@ final class AppModel: ObservableObject {
 
     func shutdown() {
         stats.stop()
+        tun.stopSync()
         runner.stopSync()
         proxy.clearSync()
     }
@@ -114,7 +121,7 @@ final class AppModel: ObservableObject {
     // MARK: - State helpers
 
     var isConnected: Bool { runner.state.isRunning }
-    var isBusy: Bool { runner.state.isStarting || proxy.isBusy }
+    var isBusy: Bool { runner.state.isStarting || proxy.isBusy || tun.isBusy }
 
     /// The routing / preference / profile inputs differ from what the running core was launched with.
     var needsReconnect: Bool {
@@ -137,6 +144,7 @@ final class AppModel: ObservableObject {
         do {
             try await runner.start(profile: p)
             if store.preferences.setSystemProxyOnConnect { await applySystemProxy() }
+            await syncTun()
             pushRecent(profileID)
             Notifier.notify(title: L10n.tr("notif.connected.title"),
                             body: String(format: L10n.tr("notif.connected.body"), p.displayName))
@@ -149,6 +157,7 @@ final class AppModel: ObservableObject {
     }
 
     func disconnect() async {
+        await tun.stop()
         await runner.stop()
         await proxy.clear()
         Notifier.notify(title: L10n.tr("notif.disconnected.title"), body: "")
@@ -170,12 +179,16 @@ final class AppModel: ObservableObject {
         guard let running = runner.currentProfile else { return }
         let profile = store.profile(running.id) ?? running
         let hadProxy = proxy.isActive
+        // A tunnel that stays wanted is kept up across the restart (no second password prompt).
+        if !store.preferences.tunEnabled { await tun.stop() }
         await runner.stop()
         do {
             try await runner.start(profile: profile)
             if hadProxy || store.preferences.setSystemProxyOnConnect { await applySystemProxy() }
+            await syncTun()
         } catch CoreRunner.RunnerError.cancelled {
         } catch {
+            await tun.stop()
             await proxy.clear()
             showBanner(error.localizedDescription, error: true)
         }
@@ -208,6 +221,58 @@ final class AppModel: ObservableObject {
         let prefs = store.preferences
         await proxy.enable(host: prefs.systemProxyHost, socksPort: ports.socks, httpPort: ports.http,
                            bypass: prefs.proxyBypassDomains)
+    }
+
+    // MARK: - TUN mode
+
+    /// The "TUN mode" switch: reflects the live tunnel while connected, the remembered choice otherwise.
+    var tunModeEnabled: Bool {
+        isConnected ? tun.isActive : store.preferences.tunEnabled
+    }
+
+    /// Why TUN can't be turned on right now, if anything is missing.
+    var tunPreflightProblem: String? {
+        if tun.resolvedBinaryPath() == nil { return TunManager.TunError.binaryMissing.errorDescription }
+        if runner.coreVersion != nil && runner.coreType != .xray { return TunManager.TunError.needsXray.errorDescription }
+        if isConnected ? runner.proxyPorts.socks == nil : !store.preferences.useSocks {
+            return TunManager.TunError.needsSocks.errorDescription
+        }
+        return nil
+    }
+
+    func setTunMode(_ on: Bool) async {
+        if on, let problem = tunPreflightProblem {
+            showBanner(problem, error: true)
+            return
+        }
+        store.preferences.tunEnabled = on
+        store.savePrefs()
+        guard isConnected else { return }
+        // The core is restarted either way: with TUN its outbounds get bound to the physical
+        // interface (so they can't loop into the tunnel); without, that binding is dropped.
+        if !on { await tun.stop() }
+        await reconnect()
+    }
+
+    /// Bring the tunnel in line with the preference once the core is (re)started.
+    private func syncTun() async {
+        guard store.preferences.tunEnabled else {
+            await tun.stop()
+            return
+        }
+        do {
+            guard let socks = runner.proxyPorts.socks else { throw TunManager.TunError.needsSocks }
+            guard runner.boundInterface != nil else {
+                throw runner.coreType == .xray ? TunManager.TunError.noNetwork : TunManager.TunError.needsXray
+            }
+            try await tun.start(socksHost: store.preferences.systemProxyHost, socksPort: socks)
+        } catch {
+            // Cancelled password prompt or a real failure: fall back to proxy-only and say why.
+            store.preferences.tunEnabled = false
+            store.savePrefs()
+            if case TunManager.TunError.cancelled = error { return }
+            showBanner(error.localizedDescription, error: true)
+        }
     }
 
     // MARK: - Routing mode
@@ -341,7 +406,11 @@ final class AppModel: ObservableObject {
         Notifier.notify(title: L10n.tr("notif.crash.title"),
                         body: String(format: L10n.tr(willRestart ? "notif.crash.body" : "notif.crash.final"), code))
         if !willRestart {
-            Task { await proxy.clear() }
+            Task {
+                // Without a core the tunnel would blackhole every connection.
+                await tun.stop()
+                await proxy.clear()
+            }
         }
     }
 
@@ -437,6 +506,7 @@ extension View {
             .environmentObject(SpeedSampler.shared)
             .environmentObject(SubscriptionService.shared)
             .environmentObject(SystemProxyManager.shared)
+            .environmentObject(TunManager.shared)
     }
 }
 
@@ -529,6 +599,11 @@ struct AppCommands: Commands {
                 get: { model.systemProxyEnabled },
                 set: { on in Task { await model.setSystemProxy(on) } }))
                 .keyboardShortcut("p", modifiers: [.command, .shift])
+            Toggle(L10n.tr("tun.title"), isOn: Binding(
+                get: { model.tunModeEnabled },
+                set: { on in Task { await model.setTunMode(on) } }))
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .disabled(model.isBusy)
             Divider()
             ForEach(Array(RoutingMode.allCases.enumerated()), id: \.element) { i, mode in
                 Toggle(mode.displayName, isOn: Binding(

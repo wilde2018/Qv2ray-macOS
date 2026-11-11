@@ -71,6 +71,8 @@ private struct GeneralSettings: View {
 
 private struct NetworkSettings: View {
     @EnvironmentObject private var store: ProfileStore
+    @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var tun: TunManager
     @State private var bypassText = ""
 
     var body: some View {
@@ -107,6 +109,25 @@ private struct NetworkSettings: View {
                             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
                     }
             }
+            Section {
+                Toggle(L10n.tr("pref.tunEnable"), isOn: Binding(
+                    get: { model.tunModeEnabled },
+                    set: { on in Task { await model.setTunMode(on) } }))
+                    .disabled(model.isBusy)
+                HStack {
+                    TextField(L10n.tr("pref.tunBinary"), text: $store.preferences.tunBinaryPath,
+                              prompt: Text(TunManager.autoDetectBinary() ?? "/opt/homebrew/bin/tun2socks"))
+                    Button(L10n.tr("common.choose")) { chooseTunBinary() }
+                }
+                if tun.resolvedBinaryPath() == nil {
+                    Label(L10n.tr("pref.tunNotFound"), systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+            } header: {
+                Text(L10n.tr("pref.tun"))
+            } footer: {
+                Text(L10n.tr("pref.tunHelp")).font(.caption).foregroundStyle(.secondary)
+            }
             Section(L10n.tr("settings.routing")) {
                 Toggle(L10n.tr("pref.bypassLAN"), isOn: $store.preferences.bypassLAN)
             }
@@ -122,6 +143,15 @@ private struct NetworkSettings: View {
         }
         .formStyle(.grouped)
         .onAppear { bypassText = store.preferences.proxyBypassDomains.joined(separator: ", ") }
+    }
+
+    private func chooseTunBinary() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.message = L10n.tr("pref.tunBinary")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        store.preferences.tunBinaryPath = url.path
     }
 }
 
@@ -161,8 +191,13 @@ private struct CoreSettings: View {
             } header: {
                 Text(L10n.tr("pref.core"))
             } footer: {
-                Text(resolvedAssets.map { String(format: L10n.tr("pref.assetsResolved"), $0) } ?? L10n.tr("pref.assetsNone"))
-                    .font(.caption).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    if let path = runner.resolvedCorePath(), BundledTools.isBundled(path) {
+                        Label(L10n.tr("pref.coreBundled"), systemImage: "shippingbox")
+                    }
+                    Text(resolvedAssets.map { String(format: L10n.tr("pref.assetsResolved"), $0) } ?? L10n.tr("pref.assetsNone"))
+                }
+                .font(.caption).foregroundStyle(.secondary)
             }
             Section(L10n.tr("settings.logAPI")) {
                 Picker(L10n.tr("pref.logLevel"), selection: $store.preferences.logLevel) {

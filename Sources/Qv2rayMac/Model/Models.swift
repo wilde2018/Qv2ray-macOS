@@ -344,6 +344,10 @@ struct Preferences: Codable, Equatable {
         "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "fe80::/10",
     ]
 
+    // TUN mode (tun2socks in front of the SOCKS inbound)
+    var tunEnabled = false
+    var tunBinaryPath: String = ""  // empty = auto-detect
+
     // Routing
     var bypassLAN = true
     var currentRoutingSchemeID: UUID? = nil
@@ -513,6 +517,8 @@ extension Preferences {
         subUserAgent = c.decode(.subUserAgent, or: subUserAgent)
         setSystemProxyOnConnect = c.decode(.setSystemProxyOnConnect, or: setSystemProxyOnConnect)
         proxyBypassDomains = c.decode(.proxyBypassDomains, or: proxyBypassDomains)
+        tunEnabled = c.decode(.tunEnabled, or: tunEnabled)
+        tunBinaryPath = c.decode(.tunBinaryPath, or: tunBinaryPath)
         bypassLAN = c.decode(.bypassLAN, or: bypassLAN)
         currentRoutingSchemeID = c.decode(.currentRoutingSchemeID, or: currentRoutingSchemeID)
         lastRuleSchemeID = c.decode(.lastRuleSchemeID, or: lastRuleSchemeID)

@@ -260,6 +260,38 @@ enum ConfigGenerator {
         return c
     }
 
+    // MARK: - TUN mode
+
+    /// Adapts a config for TUN mode: every dialing outbound is bound to the physical interface
+    /// (Xray `sockopt.interface`) so its traffic can't loop back into the tunnel, and DNS
+    /// (port 53) goes direct so resolving the server's own domain never depends on the proxy.
+    /// Outbounds that already pin an interface are left alone.
+    static func applyTun(_ root: [String: Any], interface: String) -> [String: Any] {
+        var c = root
+        var outbounds = c["outbounds"] as? [[String: Any]] ?? []
+        for i in outbounds.indices {
+            let proto = outbounds[i]["protocol"] as? String ?? ""
+            guard !["blackhole", "loopback"].contains(proto) else { continue }
+            var stream = outbounds[i]["streamSettings"] as? [String: Any] ?? [:]
+            var sockopt = stream["sockopt"] as? [String: Any] ?? [:]
+            if (sockopt["interface"] as? String ?? "").isEmpty { sockopt["interface"] = interface }
+            stream["sockopt"] = sockopt
+            outbounds[i]["streamSettings"] = stream
+        }
+        c["outbounds"] = outbounds
+
+        if let directTag = outbounds.first(where: { ($0["protocol"] as? String) == "freedom" })?["tag"] as? String {
+            var routing = c["routing"] as? [String: Any] ?? [:]
+            var rules = routing["rules"] as? [[String: Any]] ?? []
+            // After the stats API rule (it matches by inbound tag, so order between them is moot).
+            let at = rules.firstIndex(where: { ($0["outboundTag"] as? String) != "api" }) ?? rules.count
+            rules.insert(["type": "field", "port": "53", "outboundTag": directTag], at: at)
+            routing["rules"] = rules
+            c["routing"] = routing
+        }
+        return c
+    }
+
     struct ProxyPorts: Equatable {
         var socks: Int? = nil
         var http: Int? = nil
