@@ -157,7 +157,8 @@ enum L10n {
         "group.updateNow": "Update Now",
 
         "hero.noProfile": "Import a connection to get started",
-        "hero.ready": "Ready — press the power button to connect",
+        "hero.ready": "Ready — press Connect in the toolbar (⌘↩)",
+        "hero.switchNode": "Switch Node",
         "hero.uptime": "Uptime",
 
         "import.cannotDecodeQR": "No QR code found in the image",
@@ -537,7 +538,8 @@ enum L10n {
         "group.updateNow": "立即更新",
 
         "hero.noProfile": "导入一个连接即可开始",
-        "hero.ready": "已就绪 — 点击电源按钮即可连接",
+        "hero.ready": "已就绪 — 点击工具栏的“连接”（⌘↩）",
+        "hero.switchNode": "切换节点",
         "hero.uptime": "已连接",
 
         "import.cannotDecodeQR": "图片中未检测到二维码",

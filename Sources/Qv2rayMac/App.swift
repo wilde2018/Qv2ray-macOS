@@ -163,6 +163,19 @@ final class AppModel: ObservableObject {
         Notifier.notify(title: L10n.tr("notif.disconnected.title"), body: "")
     }
 
+    /// Node switch on the Overview: switches the live connection when connected, otherwise just
+    /// makes it the node "Connect" will use.
+    func chooseNode(_ id: UUID) async {
+        if runner.state.isRunning || runner.state.isStarting {
+            guard runner.currentProfile?.id != id else { return }
+            await connect(profileID: id)
+        } else {
+            // A list selection would otherwise take precedence in `preferredProfileID`.
+            selectedConnectionIDs = []
+            store.lastConnected = id
+        }
+    }
+
     func toggleConnection() async {
         if runner.state.isRunning || runner.state.isStarting {
             await disconnect()

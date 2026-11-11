@@ -75,11 +75,8 @@ struct DashboardView: View {
                 .lineLimit(3)
             }
             Spacer(minLength: 12)
-            VStack(spacing: 6) {
-                PowerButton(state: runner.state, size: 64) { Task { await model.toggleConnection() } }
-                Text(connected ? L10n.tr("conn.disconnect") : L10n.tr("conn.connect"))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if !store.data.profiles.isEmpty {
+                NodeSwitch(currentID: heroProfile?.id, connected: connected)
             }
             if heroProfile == nil {
                 Button(L10n.tr("import.title") + "…") { model.showImport() }
@@ -314,6 +311,79 @@ struct DashboardView: View {
     private func copy(_ s: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(s, forType: .string)
+    }
+}
+
+// MARK: - Node switch
+
+/// Round menu button in the hero card: pick the node to use. Switches live while connected;
+/// otherwise it just selects the node the toolbar's Connect button will use.
+private struct NodeSwitch: View {
+    @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var store: ProfileStore
+    var currentID: UUID?
+    var connected: Bool
+
+    private let size: CGFloat = 64
+
+    var body: some View {
+        let groups = store.data.groups.filter { !store.profiles(in: $0.id).isEmpty }
+        VStack(spacing: 6) {
+            Menu {
+                if groups.count == 1, let g = groups.first {
+                    nodeItems(in: g.id)
+                } else {
+                    ForEach(groups) { g in
+                        Menu {
+                            nodeItems(in: g.id)
+                        } label: {
+                            if let cur = currentID, store.groupOf(profile: cur) == g.id {
+                                Label(g.displayName, systemImage: "checkmark")
+                            } else {
+                                Text(g.displayName)
+                            }
+                        }
+                    }
+                }
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(connected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.primary.opacity(0.1)))
+                    Image(systemName: "arrow.triangle.swap")
+                        .font(.system(size: size * 0.34, weight: .semibold))
+                        .foregroundStyle(connected ? Color.white : Color.primary)
+                }
+                .frame(width: size, height: size)
+                .shadow(color: connected ? Color.accentColor.opacity(0.45) : .clear, radius: size / 5, y: 2)
+                .contentShape(Circle())
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .disabled(model.isBusy)
+            .help(L10n.tr("hero.switchNode"))
+            Text(L10n.tr("hero.switchNode"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .animation(.easeInOut(duration: 0.25), value: connected)
+    }
+
+    @ViewBuilder
+    private func nodeItems(in groupID: UUID) -> some View {
+        ForEach(store.profiles(in: groupID)) { p in
+            Toggle(isOn: Binding(
+                get: { p.id == currentID },
+                set: { _ in Task { await model.chooseNode(p.id) } })) {
+                Text(itemTitle(p))
+            }
+        }
+    }
+
+    private func itemTitle(_ p: ConnectionProfile) -> String {
+        guard let latency = store.latencies[p.id] else { return p.displayName }
+        return p.displayName + "  ·  " + (latency.map { "\($0) ms" } ?? L10n.tr("conn.timeout"))
     }
 }
 
