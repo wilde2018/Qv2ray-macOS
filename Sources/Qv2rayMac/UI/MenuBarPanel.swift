@@ -145,6 +145,17 @@ struct MenuBarPanel: View {
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .disabled(proxy.isBusy)
+
+                Toggle(isOn: Binding(get: { model.tunModeEnabled },
+                                     set: { on in Task { await model.setTunMode(on) } })) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(L10n.tr("tray.tun")).font(.callout)
+                        Text(L10n.tr("tray.tunSubtitle")).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .disabled(model.isBusy)
             }
         }
     }

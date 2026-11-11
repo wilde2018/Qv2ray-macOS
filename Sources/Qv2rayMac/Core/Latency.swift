@@ -6,12 +6,16 @@ enum LatencyTester {
 
     // MARK: TCPing
 
-    static func tcping(host: String, port: Int, timeoutMS: Int) async -> Int? {
+    /// `avoidTunnel`: while TUN mode is on, keep the probe off utun devices — Xray's userspace
+    /// stack would complete the handshake locally and report a meaningless ~1 ms.
+    static func tcping(host: String, port: Int, timeoutMS: Int, avoidTunnel: Bool = false) async -> Int? {
         await withCheckedContinuation { c in
             // One serial queue for the connection callbacks *and* the timeout, so `resumed`
             // is never touched concurrently.
             let queue = DispatchQueue(label: "qv.tcping")
-            let conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: UInt16(clamping: port)) ?? 443, using: .tcp)
+            let params = NWParameters.tcp
+            if avoidTunnel { params.prohibitedInterfaceTypes = [.other] }
+            let conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: UInt16(clamping: port)) ?? 443, using: params)
             let start = Date()
             var resumed = false
             let resume: (Int?) -> Void = { value in
@@ -32,10 +36,10 @@ enum LatencyTester {
         }
     }
 
-    static func tcping(profiles: [ConnectionProfile], timeoutMS: Int) async -> [UUID: Int?] {
+    static func tcping(profiles: [ConnectionProfile], timeoutMS: Int, avoidTunnel: Bool = false) async -> [UUID: Int?] {
         await withTaskGroup(of: (UUID, Int?).self) { group in
             for p in profiles {
-                group.addTask { (p.id, await tcping(host: p.address, port: p.port, timeoutMS: timeoutMS)) }
+                group.addTask { (p.id, await tcping(host: p.address, port: p.port, timeoutMS: timeoutMS, avoidTunnel: avoidTunnel)) }
             }
             var dict: [UUID: Int?] = [:]
             for await (id, ms) in group { dict[id] = ms }
@@ -53,6 +57,7 @@ enum LatencyTester {
         var assetsPath: String?
         var testURL: String
         var timeout: Int
+        var bindInterface: String?
     }
 
     @MainActor
@@ -66,7 +71,8 @@ enum LatencyTester {
                            arguments: runner.legacyCLI ? ["-config", configURL.path] : ["run", "-c", configURL.path],
                            configURL: configURL, runtimeDir: store.runtimeDir,
                            assetsPath: CoreRunner.resolveAssetsDir(corePath: corePath, override: prefs.assetsPath),
-                           testURL: prefs.latencyTestURL, timeout: prefs.latencyTimeoutSec)
+                           testURL: prefs.latencyTestURL, timeout: prefs.latencyTimeoutSec,
+                           bindInterface: runner.tunActive ? runner.physicalInterface : nil)
     }
 
     /// Runs a temporary core instance with one inbound per profile and measures the
@@ -77,7 +83,7 @@ enum LatencyTester {
         let basePort = findFreePortBlock(count: profiles.count)
         guard basePort > 0, let ctx = await prepareContext() else { return [:] }
 
-        let (config, ports) = ConfigGenerator.latencyTestConfig(profiles: profiles, basePort: basePort)
+        let (config, ports) = ConfigGenerator.latencyTestConfig(profiles: profiles, basePort: basePort, bindInterface: ctx.bindInterface)
         guard let data = try? jsonData(from: config), (try? data.write(to: ctx.configURL, options: .atomic)) != nil else { return [:] }
 
         let proc = Process()

@@ -93,6 +93,7 @@ final class AppModel: ObservableObject {
         runner.refreshCoreInfo()
         subs.startAutoUpdateTimer()
         Task { await proxy.recoverStaleProxy() }
+        Task { await runner.recoverStaleTunDNS() }
 
         if !store.loadWarnings.isEmpty {
             showBanner(L10n.tr("store.recovered") + "\n" + store.loadWarnings.joined(separator: "\n"), error: true, sticky: true)
@@ -210,6 +211,22 @@ final class AppModel: ObservableObject {
                            bypass: prefs.proxyBypassDomains)
     }
 
+    // MARK: - TUN mode
+
+    /// The TUN switch: like the system proxy switch it reflects the live state while connected.
+    var tunModeEnabled: Bool {
+        isConnected ? runner.tunActive : store.preferences.tunEnabled
+    }
+
+    /// Remember the choice and, when connected, restart the core with or without the tunnel
+    /// (turning it on asks for an administrator password).
+    func setTunMode(_ on: Bool) async {
+        guard store.preferences.tunEnabled != on || (isConnected && runner.tunActive != on) else { return }
+        store.preferences.tunEnabled = on
+        store.savePrefs()
+        if isConnected { await reconnect() }
+    }
+
     // MARK: - Routing mode
 
     var currentMode: RoutingMode { store.currentRoutingScheme.mode }
@@ -251,7 +268,8 @@ final class AppModel: ObservableObject {
         var results = await LatencyTester.realDelay(profiles: profiles)
         if results.isEmpty {
             // No usable core: fall back to a plain TCP handshake time.
-            results = await LatencyTester.tcping(profiles: profiles, timeoutMS: store.preferences.tcpingTimeoutMS)
+            results = await LatencyTester.tcping(profiles: profiles, timeoutMS: store.preferences.tcpingTimeoutMS,
+                                                 avoidTunnel: runner.tunActive)
         }
         for (id, ms) in results where store.profile(id) != nil { store.latencies[id] = ms }
         store.saveLatencies()
@@ -529,6 +547,11 @@ struct AppCommands: Commands {
                 get: { model.systemProxyEnabled },
                 set: { on in Task { await model.setSystemProxy(on) } }))
                 .keyboardShortcut("p", modifiers: [.command, .shift])
+            Toggle(L10n.tr("tray.tun"), isOn: Binding(
+                get: { model.tunModeEnabled },
+                set: { on in Task { await model.setTunMode(on) } }))
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .disabled(model.isBusy)
             Divider()
             ForEach(Array(RoutingMode.allCases.enumerated()), id: \.element) { i, mode in
                 Toggle(mode.displayName, isOn: Binding(

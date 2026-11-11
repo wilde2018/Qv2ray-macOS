@@ -230,6 +230,99 @@ enum SelfTest {
         check(UpdateChecker.isNewer("v2.8.0", than: "v2.7.0") && !UpdateChecker.isNewer("v2.7.0", than: "v2.7.0")
               && UpdateChecker.isNewer("v10.0.0", than: "v2.7.0"), "semver compare")
 
+        print("[10] TUN mode")
+        var tunPrefs = Preferences()
+        tunPrefs.tunEnabled = true
+        tunPrefs.tunName = "utun42"
+        var domainProfile = profile
+        domainProfile.address = "proxy.example.com"
+        let tunCfg = ConfigGenerator.withTun(ConfigGenerator.fullConfig(profile: domainProfile, prefs: tunPrefs, scheme: scheme),
+                                             prefs: tunPrefs, serverHost: "proxy.example.com", serverIPs: ["9.8.7.6"])
+        let tIn = tunCfg["inbounds"] as? [[String: Any]] ?? []
+        let tunSettings = tIn.first?["settings"] as? [String: Any]
+        check((tIn.first?["protocol"] as? String) == "tun" && (tIn.first?["tag"] as? String) == ConfigGenerator.tunTag
+              && tIn.count == 4, "tun inbound first, other inbounds kept")
+        check((tunSettings?["name"] as? String) == "utun42" && (tunSettings?["autoOutboundsInterface"] as? String) == "auto"
+              && (tunSettings?["autoSystemRoutingTable"] as? [String]) == ["0.0.0.0/0"], "tun settings (name, routes, loop guard)")
+        check(((tIn.first?["sniffing"] as? [String: Any])?["destOverride"] as? [String])?.contains("tls") == true, "tun sniffing on")
+        let tOut = tunCfg["outbounds"] as? [[String: Any]] ?? []
+        check((tOut.first?["tag"] as? String) == "proxy", "proxy stays the default (first) outbound")
+        check(tOut.contains { ($0["tag"] as? String) == "dns-out" && ($0["protocol"] as? String) == "dns" }, "dns outbound added")
+        let tDirect = tOut.first { ($0["tag"] as? String) == "direct" }
+        check(((tDirect?["settings"] as? [String: Any])?["domainStrategy"] as? String) == "UseIP", "direct resolves via Xray DNS")
+        let tSockopt = (tOut.first?["streamSettings"] as? [String: Any])?["sockopt"] as? [String: Any]
+        check((tSockopt?["domainStrategy"] as? String) == "UseIP", "proxy server resolved via Xray DNS")
+        let tDNS = tunCfg["dns"] as? [String: Any]
+        check(((tDNS?["hosts"] as? [String: Any])?["proxy.example.com"] as? [String]) == ["9.8.7.6"], "server IP pinned in dns.hosts")
+        check(!((tDNS?["servers"] as? [Any]) ?? []).contains { ($0 as? String) == "localhost" }, "no localhost DNS (would loop)")
+        let tRules = ((tunCfg["routing"] as? [String: Any])?["rules"] as? [[String: Any]]) ?? []
+        check((tRules.first?["inboundTag"] as? [String]) == ["api"]
+              && (tRules[1]["outboundTag"] as? String) == "dns-out" && (tRules[1]["port"] as? String) == "53"
+              && (tRules[1]["inboundTag"] as? [String]) == [ConfigGenerator.tunTag], "DNS hijack rule right after the api rule")
+        check(ConfigGenerator.hasTunInbound(tunCfg) && !ConfigGenerator.hasTunInbound(cfg), "hasTunInbound")
+        check((try? jsonData(from: tunCfg)) != nil, "TUN config is valid JSON")
+
+        var noHijack = tunPrefs; noHijack.tunHijackDNS = false; noHijack.tunName = "en0"
+        let ipCfg = ConfigGenerator.withTun(ConfigGenerator.fullConfig(profile: profile, prefs: noHijack, scheme: scheme),
+                                            prefs: noHijack, serverHost: "1.2.3.4", serverIPs: [])
+        let ipOut = ipCfg["outbounds"] as? [[String: Any]] ?? []
+        check(!ipOut.contains { ($0["tag"] as? String) == "dns-out" }
+              && !(((ipCfg["routing"] as? [String: Any])?["rules"] as? [[String: Any]]) ?? []).contains { ($0["outboundTag"] as? String) == "dns-out" },
+              "no DNS hijack when disabled")
+        check((ipCfg["dns"] as? [String: Any])?["hosts"] == nil
+              && ((ipOut.first?["streamSettings"] as? [String: Any])?["sockopt"] as? [String: Any])?["domainStrategy"] == nil,
+              "IP server: nothing pinned")
+        check(((ipCfg["inbounds"] as? [[String: Any]])?.first?["settings"] as? [String: Any])?["name"] == nil, "invalid utun name dropped")
+        let twice = ConfigGenerator.withTun(ipCfg, prefs: noHijack)["inbounds"] as? [[String: Any]] ?? []
+        check(twice.filter { ($0["protocol"] as? String) == "tun" }.count == 1, "withTun is idempotent for the inbound")
+
+        var dnsPrefs = Preferences()
+        dnsPrefs.tunDNSServers = "1.1.1.1, bogus 2606:4700:4700::1111"
+        check(dnsPrefs.effectiveTunDNSServers == ["1.1.1.1", "2606:4700:4700::1111"], "TUN DNS list keeps IP literals only")
+        dnsPrefs.tunDNSServers = "; rm -rf /"
+        check(dnsPrefs.effectiveTunDNSServers == ["8.8.8.8"], "TUN DNS falls back when nothing valid")
+        check(Preferences().tunEnabled == false && Preferences().tunHijackDNS, "TUN defaults")
+        let oldPrefs = try? JSONDecoder().decode(Preferences.self, from: Data(#"{"socksPort":1}"#.utf8))
+        check(oldPrefs?.tunEnabled == false && oldPrefs?.tunMTU == 1500, "old preferences decode with TUN defaults")
+        var sigTun = prefs; sigTun.tunEnabled = true
+        check(CoreRunner.signature(profile: profile, prefs: prefs, scheme: scheme)
+              != CoreRunner.signature(profile: profile, prefs: sigTun, scheme: scheme), "toggling TUN asks for a reconnect")
+
+        let bound = ConfigGenerator.latencyTestConfig(profiles: [profile], basePort: 30000, bindInterface: "en0").config
+        let bOut = (bound["outbounds"] as? [[String: Any]])?.first
+        check((((bOut?["streamSettings"] as? [String: Any])?["sockopt"] as? [String: Any])?["interface"] as? String) == "en0",
+              "latency test bound to the physical interface")
+
+        // The wrapper, end to end without root: same AppleScript/shell quoting, fake core = /bin/sleep.
+        let weird = home.appendingPathComponent(#"tun it's "q" \dir"#, isDirectory: true)
+        weird.createDirIfNeeded()
+        let tp = TunLauncher.Paths(dir: weird)
+        let fakeCfg = weird.appendingPathComponent("config.json")
+        try? Data("{}".utf8).write(to: fakeCfg)
+        TunLauncher.prepare(tp)
+        let cmd = TunLauncher.shellCommand(corePath: "/bin/sleep", coreArgs: ["30"], configPath: fakeCfg.path, paths: tp,
+                                           appPID: getpid(), dnsServers: [], assetsDir: "/tmp/a b'c")
+        let osa = Process()
+        osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        osa.arguments = ["-e", TunLauncher.appleScript(command: cmd, prompt: "x", admin: false)]
+        osa.standardOutput = Pipe()
+        osa.standardError = Pipe()
+        var started = false
+        if (try? osa.run()) != nil {
+            let deadline = Date().addingTimeInterval(5)
+            while !TunLauncher.isReady(tp) && osa.isRunning && Date() < deadline { usleep(50_000) }
+            started = TunLauncher.isReady(tp) && osa.isRunning
+        }
+        check(started, "wrapper starts the core and signals ready (quoting survives ' \" \\ and spaces)")
+        TunLauncher.requestStop(tp)
+        let stopDeadline = Date().addingTimeInterval(6)
+        while osa.isRunning && Date() < stopDeadline { usleep(50_000) }
+        if osa.isRunning { osa.terminate() }
+        let wrapperLog = (try? String(contentsOf: tp.log, encoding: .utf8)) ?? ""
+        check(!osa.isRunning && wrapperLog.contains("[tun] core exited"), "stop file ends the session without privileges")
+        check(TunLauncher.appleScript(command: "a\"b\\c", prompt: "p").hasSuffix("with administrator privileges")
+              && TunLauncher.appleScript(command: "a\"b\\c", prompt: "p").contains(#"a\"b\\c"#), "AppleScript escaping")
+
         print("[9] Localization")
         func specs(_ s: String) -> [String] {
             let regex = try! NSRegularExpression(pattern: "%(@|d|ld|%)")

@@ -64,6 +64,13 @@ final class CoreRunner: ObservableObject {
     @Published private(set) var proxyPorts = ConfigGenerator.ProxyPorts()
     /// Fingerprint of the inputs the running core was launched with.
     private(set) var launchSignature = ""
+    /// The running core owns a TUN device (it runs as root through `TunLauncher`).
+    @Published private(set) var tunActive = false
+    /// The physical interface that carried the default route before the tunnel came up.
+    private(set) var physicalInterface: String? = nil
+    /// Set while the current process is the privileged TUN wrapper.
+    private var tunTailer: LogTailer? = nil
+    private var tunPaths: TunLauncher.Paths { .init(dir: ProfileStore.shared.runtimeDir) }
 
     /// Called when the core dies unexpectedly. `willRestart` = an automatic restart is scheduled.
     var onCrash: ((_ code: Int32, _ willRestart: Bool) -> Void)?
@@ -189,8 +196,21 @@ final class CoreRunner: ObservableObject {
                 throw RunnerError.invalidConfig
             }
             config = ConfigGenerator.prepareCustom(obj, prefs: prefs)
+        } else if prefs.tunEnabled {
+            // Resolve the server while the system DNS is still untouched (see ConfigGenerator.withTun).
+            let host = ConfigGenerator.overrideOutbound(profile) == nil ? profile.address : ""
+            let ips = await Task.detached { TunLauncher.resolve(host: host) }.value
+            guard gen == generation else { throw RunnerError.cancelled }
+            config = ConfigGenerator.withTun(
+                ConfigGenerator.fullConfig(profile: profile, prefs: prefs, scheme: store.currentRoutingScheme),
+                prefs: prefs, serverHost: host, serverIPs: ips)
         } else {
             config = ConfigGenerator.fullConfig(profile: profile, prefs: prefs, scheme: store.currentRoutingScheme)
+        }
+        let usesTun = ConfigGenerator.hasTunInbound(config)
+        if usesTun && coreType == .v2ray && coreVersion != nil {
+            state = .failed(L10n.tr("tun.needsXray"))
+            throw RunnerError.tunNeedsXray
         }
 
         // Pre-flight: every inbound port must be free
@@ -207,20 +227,32 @@ final class CoreRunner: ObservableObject {
             throw RunnerError.invalidConfig
         }
 
-        appendLog("→ Starting core for «\(profile.displayName)»")
+        appendLog("→ Starting core for «\(profile.displayName)»" + (usesTun ? " (TUN)" : ""))
         let logMark = nextLogID
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: corePath)
         var args = legacyCLI ? ["-config", configURL.path] : ["run", "-c", configURL.path]
         args += prefs.extraCoreArgs.split(separator: " ").map(String.init)
-        p.arguments = args
-        p.currentDirectoryURL = store.runtimeDir
-        var env = ProcessInfo.processInfo.environment
-        if let assets = Self.resolveAssetsDir(corePath: corePath, override: prefs.assetsPath) {
-            env["XRAY_LOCATION_ASSET"] = assets
-            env["V2RAY_LOCATION_ASSET"] = assets
+        let assets = Self.resolveAssetsDir(corePath: corePath, override: prefs.assetsPath)
+        let p: Process
+        if usesTun {
+            let paths = tunPaths
+            TunLauncher.prepare(paths)
+            physicalInterface = await Task.detached { TunLauncher.defaultInterface() }.value
+            guard gen == generation else { throw RunnerError.cancelled }
+            p = TunLauncher.makeProcess(corePath: corePath, coreArgs: args, configPath: configURL.path, paths: paths,
+                                        dnsServers: prefs.tunHijackDNS && profile.proto != .custom ? prefs.effectiveTunDNSServers : [],
+                                        assetsDir: assets, prompt: L10n.tr("tun.authPrompt"))
+        } else {
+            p = Process()
+            p.executableURL = URL(fileURLWithPath: corePath)
+            p.arguments = args
+            p.currentDirectoryURL = store.runtimeDir
+            var env = ProcessInfo.processInfo.environment
+            if let assets {
+                env["XRAY_LOCATION_ASSET"] = assets
+                env["V2RAY_LOCATION_ASSET"] = assets
+            }
+            p.environment = env
         }
-        p.environment = env
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -247,6 +279,34 @@ final class CoreRunner: ObservableObject {
         startLogPipe(stderr.fileHandleForReading)
         openLogFile()
 
+        if usesTun {
+            // Wait for the password dialog: the wrapper writes the ready file once the core is launched.
+            let paths = tunPaths
+            appendLog("→ Waiting for administrator authorization…")
+            let deadline = Date().addingTimeInterval(300)
+            while !TunLauncher.isReady(paths) && p.isRunning && Date() < deadline {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard gen == generation else { throw RunnerError.cancelled }
+            }
+            if !TunLauncher.isReady(paths) {
+                if p.isRunning { p.terminate() }
+                // Let the osascript error ("User canceled. (-128)") reach the log first.
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                intendedRunning = false
+                process = nil
+                currentProfile = nil
+                closeLogFile()
+                let canceled = logLines.contains { $0.id >= logMark && $0.text.contains("-128") }
+                let detail = canceled ? L10n.tr("tun.authCanceled")
+                    : (logLines.filter { $0.id >= logMark && $0.level != .app }.suffix(3).map(\.text).joined(separator: "\n"))
+                state = .failed(detail.isEmpty ? L10n.tr("conn.connectionFailed") : detail)
+                throw canceled ? RunnerError.authCanceled : RunnerError.exitedEarly(detail)
+            }
+            let tailer = LogTailer(url: paths.log) { [weak self] text in self?.appendLog(text) }
+            tailer.start()
+            tunTailer = tailer
+        }
+
         // Config errors usually make the core exit within a second.
         try? await Task.sleep(nanoseconds: 1_200_000_000)
         guard gen == generation else { throw RunnerError.cancelled }
@@ -254,11 +314,14 @@ final class CoreRunner: ObservableObject {
             intendedRunning = false
             process = nil
             currentProfile = nil
+            stopTunTailer()
             closeLogFile()
-            let detail = logLines.filter { $0.id >= logMark && $0.level != .app }.suffix(3).map(\.text).joined(separator: "\n")
+            let detail = logLines.filter { $0.id >= logMark && $0.level != .app && !Self.isWrapperNoise($0.text) }
+                .suffix(3).map(\.text).joined(separator: "\n")
             state = .failed(detail.isEmpty ? L10n.tr("conn.connectionFailed") : detail)
             throw RunnerError.exitedEarly(detail)
         }
+        tunActive = usesTun
 
         state = .running(pid: p.processIdentifier, name: profile.displayName)
         startedAt = Date()
@@ -274,6 +337,17 @@ final class CoreRunner: ObservableObject {
         }
     }
 
+    /// Lines the privileged wrapper / osascript add that aren't the core's own words.
+    private static func isWrapperNoise(_ text: String) -> Bool {
+        text.hasPrefix("[tun]") || text.contains("execution error")
+    }
+
+    /// Whether `p` is the osascript wrapper of a TUN session (stopped via the stop file, not signals:
+    /// the core runs as root, so the app can't signal it).
+    private func isPrivileged(_ p: Process) -> Bool {
+        p.executableURL?.path == "/usr/bin/osascript"
+    }
+
     /// Stops the core without blocking the main thread (SIGTERM, then SIGKILL after 3 s).
     func stop() async {
         generation &+= 1
@@ -282,6 +356,11 @@ final class CoreRunner: ObservableObject {
         let wasActive = process != nil || state.isRunning || state.isStarting
         if let p = process {
             process = nil
+            if p.isRunning && isPrivileged(p) {
+                TunLauncher.requestStop(tunPaths)
+                // The wrapper polls every 0.25 s and gives the core 3 s before SIGKILL; it then restores DNS.
+                for _ in 0..<120 where p.isRunning { try? await Task.sleep(nanoseconds: 50_000_000) }
+            }
             if p.isRunning {
                 p.terminate()
                 for _ in 0..<60 where p.isRunning { try? await Task.sleep(nanoseconds: 50_000_000) }
@@ -298,6 +377,11 @@ final class CoreRunner: ObservableObject {
         let wasActive = process != nil
         if let p = process {
             process = nil
+            if p.isRunning && isPrivileged(p) {
+                TunLauncher.requestStop(tunPaths)
+                let deadline = Date().addingTimeInterval(5)
+                while p.isRunning && Date() < deadline { usleep(20_000) }
+            }
             if p.isRunning {
                 p.terminate()
                 let deadline = Date().addingTimeInterval(2)
@@ -309,13 +393,29 @@ final class CoreRunner: ObservableObject {
     }
 
     private func finishStop(wasActive: Bool) {
+        stopTunTailer()
         if wasActive { appendLog("■ Core stopped") }
         state = .stopped
         currentProfile = nil
         startedAt = nil
         proxyPorts = ConfigGenerator.ProxyPorts()
         launchSignature = ""
+        tunActive = false
         closeLogFile()
+    }
+
+    private func stopTunTailer() {
+        tunTailer?.stop()
+        tunTailer = nil
+    }
+
+    /// Undo a system DNS change a previous TUN session never restored (launch-time recovery).
+    func recoverStaleTunDNS() async {
+        let paths = tunPaths
+        guard FileManager.default.fileExists(atPath: paths.dnsBackup.path) else { return }
+        let ok = await Task.detached { TunLauncher.recoverStaleDNS(paths) }.value
+        appendLog(ok ? "↻ Restored the system DNS left over from an earlier TUN session"
+                     : "✗ Couldn't restore the system DNS from an earlier TUN session; it will be restored after the next TUN session")
     }
 
     private func handleTermination(of proc: Process, code: Int32) {
@@ -323,6 +423,8 @@ final class CoreRunner: ObservableObject {
         // window (start() reports those itself — no spurious "crashed" notification).
         guard proc === process, intendedRunning, state.isRunning else { return }
         process = nil
+        stopTunTailer()
+        tunActive = false
         let prefs = ProfileStore.shared.preferences
         appendLog("✗ Core exited unexpectedly (code \(code))")
         let willRestart = prefs.autoRestartCore && restartCount < prefs.maxRestartAttempts
@@ -450,9 +552,13 @@ final class CoreRunner: ObservableObject {
         case launchFailed
         case exitedEarly(String)
         case cancelled
+        case authCanceled
+        case tunNeedsXray
 
         var errorDescription: String? {
             switch self {
+            case .authCanceled: return L10n.tr("tun.authCanceled")
+            case .tunNeedsXray: return L10n.tr("tun.needsXray")
             case .coreMissing: return L10n.tr("common.coreMissing")
             case .portInUse(let p): return String(format: L10n.tr("common.portInUse"), p)
             case .invalidConfig: return L10n.tr("common.invalidJSON")

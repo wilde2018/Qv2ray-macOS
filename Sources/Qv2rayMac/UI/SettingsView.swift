@@ -108,6 +108,7 @@ private struct NetworkSettings: View {
                             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
                     }
             }
+            TunSettingsSection()
             Section(L10n.tr("settings.routing")) {
                 Toggle(L10n.tr("pref.bypassLAN"), isOn: $store.preferences.bypassLAN)
             }
@@ -123,6 +124,42 @@ private struct NetworkSettings: View {
         }
         .formStyle(.grouped)
         .onAppear { bypassText = store.preferences.proxyBypassDomains.joined(separator: ", ") }
+    }
+}
+
+// MARK: - TUN
+
+private struct TunSettingsSection: View {
+    @EnvironmentObject private var store: ProfileStore
+    @EnvironmentObject private var runner: CoreRunner
+
+    var body: some View {
+        Section {
+            Toggle(L10n.tr("pref.tunEnabled"), isOn: $store.preferences.tunEnabled)
+            if store.preferences.tunEnabled {
+                TextField(L10n.tr("pref.tunName"), text: $store.preferences.tunName, prompt: Text(L10n.tr("pref.auto")))
+                TextField(L10n.tr("pref.tunMTU"), value: $store.preferences.tunMTU, format: .number.grouping(.never))
+                Toggle(L10n.tr("pref.tunHijackDNS"), isOn: $store.preferences.tunHijackDNS)
+                if store.preferences.tunHijackDNS {
+                    TextField(L10n.tr("pref.tunDNS"), text: $store.preferences.tunDNSServers, prompt: Text("8.8.8.8"))
+                }
+            }
+        } header: {
+            Text(L10n.tr("pref.tun"))
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L10n.tr("pref.tunHelp")).font(.caption).foregroundStyle(.secondary)
+                if store.preferences.tunEnabled && runner.coreType == .v2ray && runner.coreVersion != nil {
+                    Label(L10n.tr("tun.needsXray"), systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                let name = store.preferences.tunName.trimmingCharacters(in: .whitespaces)
+                if !name.isEmpty && store.preferences.effectiveTunName.isEmpty {
+                    Label(L10n.tr("pref.tunNameInvalid"), systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+            }
+        }
     }
 }
 

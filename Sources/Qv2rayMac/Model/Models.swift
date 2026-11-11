@@ -344,6 +344,15 @@ struct Preferences: Codable, Equatable {
         "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "fe80::/10",
     ]
 
+    // TUN mode (Xray `tun` inbound, run with administrator privileges)
+    var tunEnabled = false
+    /// utunN interface name; empty = let Xray pick one.
+    var tunName = ""
+    var tunMTU = 1500
+    /// Point the system DNS at `tunDNSServers` and answer port-53 traffic with Xray's DNS module.
+    var tunHijackDNS = true
+    var tunDNSServers = "8.8.8.8"
+
     // Routing
     var bypassLAN = true
     var currentRoutingSchemeID: UUID? = nil
@@ -360,6 +369,19 @@ struct Preferences: Codable, Equatable {
 
     /// Address the inbounds listen on.
     var effectiveListenAddress: String { allowFromLAN ? "0.0.0.0" : (listenAddress.isEmpty ? "127.0.0.1" : listenAddress) }
+
+    /// The system DNS servers TUN mode installs (valid IP literals only; falls back to 8.8.8.8).
+    var effectiveTunDNSServers: [String] {
+        let ips = ConfigGenerator.splitList(tunDNSServers.replacingOccurrences(of: " ", with: ","))
+            .filter(ConfigGenerator.isIPAddress)
+        return ips.isEmpty ? ["8.8.8.8"] : ips
+    }
+
+    /// The utun name actually used: empty (Xray picks) or a valid `utunN`.
+    var effectiveTunName: String {
+        let n = tunName.trimmingCharacters(in: .whitespaces)
+        return n.range(of: #"^utun[0-9]{1,4}$"#, options: .regularExpression) != nil ? n : ""
+    }
 
     /// Host macOS should use to reach the local inbounds.
     var systemProxyHost: String {
@@ -513,6 +535,11 @@ extension Preferences {
         subUserAgent = c.decode(.subUserAgent, or: subUserAgent)
         setSystemProxyOnConnect = c.decode(.setSystemProxyOnConnect, or: setSystemProxyOnConnect)
         proxyBypassDomains = c.decode(.proxyBypassDomains, or: proxyBypassDomains)
+        tunEnabled = c.decode(.tunEnabled, or: tunEnabled)
+        tunName = c.decode(.tunName, or: tunName)
+        tunMTU = c.decode(.tunMTU, or: tunMTU)
+        tunHijackDNS = c.decode(.tunHijackDNS, or: tunHijackDNS)
+        tunDNSServers = c.decode(.tunDNSServers, or: tunDNSServers)
         bypassLAN = c.decode(.bypassLAN, or: bypassLAN)
         currentRoutingSchemeID = c.decode(.currentRoutingSchemeID, or: currentRoutingSchemeID)
         lastRuleSchemeID = c.decode(.lastRuleSchemeID, or: lastRuleSchemeID)

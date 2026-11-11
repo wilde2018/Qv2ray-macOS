@@ -227,6 +227,96 @@ enum ConfigGenerator {
         return stream
     }
 
+    // MARK: - TUN mode
+
+    static let tunTag = "tun_IN"
+    static let dnsOutTag = "dns-out"
+    static let defaultDNSServers = ["1.1.1.1", "8.8.8.8"]
+
+    /// Xray's `tun` inbound. Xray creates the utun device, adds the system routes
+    /// (`autoSystemRoutingTable`) and binds every outbound to the physical interface
+    /// (`autoOutboundsInterface`) so proxied traffic can't loop back into the tunnel.
+    static func tunInbound(prefs: Preferences) -> [String: Any] {
+        var settings: [String: Any] = [
+            "mtu": min(max(prefs.tunMTU, 576), 9000),
+            "autoSystemRoutingTable": ["0.0.0.0/0"],
+            "autoOutboundsInterface": "auto",
+            "userLevel": 0,
+        ]
+        let name = prefs.effectiveTunName
+        if !name.isEmpty { settings["name"] = name }
+        // Sniffing is what makes domain rules (geosite:…) work for raw IP connections.
+        return ["tag": tunTag, "protocol": "tun", "settings": settings,
+                "sniffing": ["enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": false] as [String: Any]]
+    }
+
+    /// Turns a generated config into its TUN-mode variant.
+    /// - `serverHost` / `serverIPs`: the proxy server's address resolved *before* the tunnel
+    ///   comes up. Pinning it in `dns.hosts` (and resolving through Xray's DNS via
+    ///   `sockopt.domainStrategy`) means connecting to the server never depends on DNS
+    ///   that itself has to go through the server.
+    static func withTun(_ config: [String: Any], prefs: Preferences, serverHost: String? = nil, serverIPs: [String] = []) -> [String: Any] {
+        var c = config
+        var inbounds = c["inbounds"] as? [[String: Any]] ?? []
+        inbounds.removeAll { ($0["protocol"] as? String) == "tun" }
+        inbounds.insert(tunInbound(prefs: prefs), at: 0)
+        c["inbounds"] = inbounds
+
+        let pinServer = serverHost.map { !$0.isEmpty && !isIPAddress($0) } == true && !serverIPs.isEmpty
+        var outbounds = c["outbounds"] as? [[String: Any]] ?? []
+        for i in outbounds.indices {
+            let tag = outbounds[i]["tag"] as? String
+            if tag == "direct", (outbounds[i]["protocol"] as? String) == "freedom" {
+                // Resolve direct destinations with Xray's DNS instead of the (hijacked) system resolver.
+                var s = outbounds[i]["settings"] as? [String: Any] ?? [:]
+                if s["domainStrategy"] == nil { s["domainStrategy"] = "UseIP" }
+                outbounds[i]["settings"] = s
+            } else if tag == "proxy", pinServer {
+                var stream = outbounds[i]["streamSettings"] as? [String: Any] ?? [:]
+                var sockopt = stream["sockopt"] as? [String: Any] ?? [:]
+                if sockopt["domainStrategy"] == nil { sockopt["domainStrategy"] = "UseIP" }
+                stream["sockopt"] = sockopt
+                outbounds[i]["streamSettings"] = stream
+            }
+        }
+        if prefs.tunHijackDNS && !outbounds.contains(where: { ($0["tag"] as? String) == dnsOutTag }) {
+            outbounds.append(["tag": dnsOutTag, "protocol": "dns", "settings": [String: Any]()])
+        }
+        c["outbounds"] = outbounds
+
+        // "localhost" would ask the system resolver, which TUN mode points back at Xray.
+        var dns = c["dns"] as? [String: Any] ?? [:]
+        var servers = (dns["servers"] as? [Any] ?? []).filter { ($0 as? String) != "localhost" }
+        if servers.isEmpty { servers = defaultDNSServers }
+        dns["servers"] = servers
+        if pinServer, let host = serverHost {
+            var hosts = dns["hosts"] as? [String: Any] ?? [:]
+            hosts[host] = serverIPs
+            dns["hosts"] = hosts
+        }
+        c["dns"] = dns
+
+        if prefs.tunHijackDNS {
+            var routing = c["routing"] as? [String: Any] ?? [:]
+            var rules = routing["rules"] as? [[String: Any]] ?? []
+            let afterAPI = (rules.first?["inboundTag"] as? [String]) == ["api"] ? 1 : 0
+            rules.insert(["type": "field", "inboundTag": [tunTag], "port": "53", "outboundTag": dnsOutTag], at: afterAPI)
+            routing["rules"] = rules
+            c["routing"] = routing
+        }
+        return c
+    }
+
+    /// Whether a config asks for a TUN device (and therefore must run as root).
+    static func hasTunInbound(_ config: [String: Any]) -> Bool {
+        (config["inbounds"] as? [[String: Any]] ?? []).contains { ($0["protocol"] as? String) == "tun" }
+    }
+
+    static func isIPAddress(_ s: String) -> Bool {
+        var v4 = in_addr(), v6 = in6_addr()
+        return inet_pton(AF_INET, s, &v4) == 1 || inet_pton(AF_INET6, s, &v6) == 1
+    }
+
     // MARK: - Custom (full JSON) configs
 
     /// Fill in what a hand-written config usually lacks, like Qv2ray does: a log level,
@@ -292,7 +382,9 @@ enum ConfigGenerator {
 
     /// A minimal config used for parallel real-delay testing:
     /// one SOCKS inbound per profile, each routed to its own tagged outbound.
-    static func latencyTestConfig(profiles: [ConnectionProfile], basePort: Int) -> (config: [String: Any], ports: [UUID: Int]) {
+    /// `bindInterface`: while TUN mode is on, test traffic must leave through the physical
+    /// interface, or it would be proxied twice and the numbers would be meaningless.
+    static func latencyTestConfig(profiles: [ConnectionProfile], basePort: Int, bindInterface: String? = nil) -> (config: [String: Any], ports: [UUID: Int]) {
         var inbounds: [[String: Any]] = []
         var outbounds: [[String: Any]] = []
         var rules: [[String: Any]] = []
@@ -308,6 +400,13 @@ enum ConfigGenerator {
             ])
             var o = outbound(for: p)
             o["tag"] = tag
+            if let iface = bindInterface, !iface.isEmpty {
+                var stream = o["streamSettings"] as? [String: Any] ?? [:]
+                var sockopt = stream["sockopt"] as? [String: Any] ?? [:]
+                sockopt["interface"] = iface
+                stream["sockopt"] = sockopt
+                o["streamSettings"] = stream
+            }
             outbounds.append(o)
             rules.append(["type": "field", "inboundTag": [tag], "outboundTag": tag])
         }
