@@ -136,28 +136,32 @@ struct MenuBarPanel: View {
 
                 Divider()
 
-                Toggle(isOn: Binding(get: { model.systemProxyEnabled },
-                                     set: { on in Task { await model.setSystemProxy(on) } })) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(L10n.tr("tray.systemProxy")).font(.callout)
-                        Text(proxySubtitle).font(.caption2).foregroundStyle(.secondary)
-                    }
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .disabled(proxy.isBusy)
+                switchRow(title: L10n.tr("tray.systemProxy"), subtitle: proxySubtitle,
+                          isOn: Binding(get: { model.systemProxyEnabled },
+                                        set: { on in Task { await model.setSystemProxy(on) } }))
+                    .disabled(proxy.isBusy)
 
-                Toggle(isOn: Binding(get: { model.tunModeEnabled },
-                                     set: { on in Task { await model.setTunMode(on) } })) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(L10n.tr("tun.title")).font(.callout)
-                        Text(tunSubtitle).font(.caption2).foregroundStyle(.secondary)
-                    }
-                }
+                switchRow(title: L10n.tr("tun.title"), subtitle: tunSubtitle,
+                          isOn: Binding(get: { model.tunModeEnabled },
+                                        set: { on in Task { await model.setTunMode(on) } }))
+                    .disabled(model.isBusy)
+            }
+        }
+    }
+
+    /// A label on the left and a switch pinned to the trailing edge, so every
+    /// switch in the card lines up regardless of label width.
+    private func switchRow(title: String, subtitle: String, isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.callout)
+                Text(subtitle).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Toggle(title, isOn: isOn)
+                .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .disabled(model.isBusy)
-            }
         }
     }
 
